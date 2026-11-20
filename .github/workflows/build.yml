@@ -18,8 +18,12 @@ jobs:
       - name: Install Google Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Configure Bubblewrap Paths
-        run: bubblewrap updateConfig --jdkPath="$JAVA_HOME" --androidSdkPath="$ANDROID_HOME"
+      - name: Configure Bubblewrap Paths Non-Interactively
+        run: |
+          mkdir -p ~/.bubblewrap
+          JDK_DIR="${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          printf '{"jdkPath":"%s","androidSdkPath":"%s"}\n' "$JDK_DIR" "$ANDROID_HOME" > ~/.bubblewrap/config.json
+          cat ~/.bubblewrap/config.json
 
       - name: Generate Private Signing Keystore
         run: |
