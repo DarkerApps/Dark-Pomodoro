@@ -46,15 +46,73 @@ jobs:
           npm install --legacy-peer-deps
           npm run build
 
-          INDEX_FILE=$(find dist build -maxdepth 3 -name "index.html" 2>/dev/null | head -n 1)
-          if [ -z "$INDEX_FILE" ]; then
-            echo "ERROR: index.html not found in build output!"
-            exit 1
-          fi
+          cat << 'EOF' > build-offline-assets.mjs
+          import fs from "fs";
+          import path from "path";
+          import { spawn } from "child_process";
 
-          OUT_DIR=$(dirname "$INDEX_FILE")
-          echo "Copying compiled frontend from: $OUT_DIR"
-          cp -r "$OUT_DIR"/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const assetsDir = path.join(workspace, "offline-app/app/src/main/assets");
+          fs.mkdirSync(assetsDir, { recursive: true });
+
+          const candidates = [".output/public", "dist/client", "dist", "build"];
+          const staticDir = candidates.find((dir) => fs.existsSync(dir) && fs.statSync(dir).isDirectory());
+
+          if (staticDir) {
+            console.log("Copying static assets from:", staticDir);
+            fs.cpSync(staticDir, assetsDir, { recursive: true });
+          }
+
+          const indexOut = path.join(assetsDir, "index.html");
+          if (fs.existsSync(indexOut) && fs.statSync(indexOut).size > 100) {
+            console.log("Found static index.html:", fs.statSync(indexOut).size, "bytes");
+            process.exit(0);
+          }
+
+          console.log("Pre-rendering index.html from built Nitro/Vite server...");
+          const hasNitroServer = fs.existsSync(".output/server/index.mjs");
+          const cmd = hasNitroServer ? "node" : "npx";
+          const args = hasNitroServer
+            ? [".output/server/index.mjs"]
+            : ["vite", "preview", "--port", "4173", "--host", "127.0.0.1"];
+
+          const server = spawn(cmd, args, {
+            env: {
+              ...process.env,
+              PORT: "4173",
+              NITRO_PORT: "4173",
+              HOST: "127.0.0.1",
+              NITRO_HOST: "127.0.0.1",
+              NODE_ENV: "production",
+            },
+            stdio: "inherit",
+          });
+
+          async function waitAndCapture() {
+            for (let i = 0; i < 40; i++) {
+              await new Promise((r) => setTimeout(r, 500));
+              try {
+                const res = await fetch("http://127.0.0.1:4173/");
+                if (res.ok) {
+                  const html = await res.text();
+                  if (html && html.includes("<html")) {
+                    fs.writeFileSync(indexOut, html, "utf8");
+                    console.log("Successfully pre-rendered index.html:", html.length, "bytes");
+                    server.kill("SIGTERM");
+                    process.exit(0);
+                  }
+                }
+              } catch (_) {}
+            }
+            console.error("ERROR: Timed out waiting for server to render index.html");
+            server.kill("SIGTERM");
+            process.exit(1);
+          }
+
+          waitAndCapture();
+          EOF
+
+          node build-offline-assets.mjs
           ls -la "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
 
       - name: Generate Private Signing Keystore
@@ -308,7 +366,7 @@ jobs:
                       public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                           if ("appassets.androidplatform.net".equals(request.getUrl().getHost())) {
                               String path = request.getUrl().getPath();
-                              if (path == null || path.equals("/") || !path.contains(".")) {
+                              if (path == null || path.isEmpty() || path.equals("/") || !path.contains(".")) {
                                   try {
                                       return new WebResourceResponse(
                                           "text/html",
