@@ -49,6 +49,7 @@ jobs:
           cat << 'EOF' > build-offline-assets.mjs
           import fs from "fs";
           import path from "path";
+          import http from "http";
           import { pathToFileURL } from "url";
 
           const workspace = process.env.GITHUB_WORKSPACE;
@@ -69,91 +70,81 @@ jobs:
             process.exit(0);
           }
 
-          // 1. Try invoking Nitro's Web Fetch handler directly in memory (no TCP port needed)
+          async function renderViaNodeListener(listener) {
+            return await new Promise((resolve, reject) => {
+              const server = http.createServer(listener);
+              server.listen(0, "127.0.0.1", async () => {
+                try {
+                  const addr = server.address();
+                  const res = await fetch(`http://127.0.0.1:${addr.port}/`);
+                  const text = await res.text();
+                  server.close();
+                  resolve(text);
+                } catch (err) {
+                  server.close();
+                  reject(err);
+                }
+              });
+            });
+          }
+
           const nitroEntry = path.resolve(".output/server/index.mjs");
-          if (fs.existsSync(nitroEntry)) {
-            try {
-              const mod = await import(pathToFileURL(nitroEntry).href);
-              const fetchFn = mod?.default?.fetch || mod?.fetch;
-              if (typeof fetchFn === "function") {
-                const res = await fetchFn(new Request("http://localhost/"));
-                const html = await res.text();
-                if (html && html.includes("<html")) {
-                  fs.writeFileSync(indexOut, html, "utf8");
-                  console.log("Rendered index.html via Nitro fetch handler:", html.length, "bytes");
-                  process.exit(0);
-                }
-              }
-            } catch (err) {
-              console.log("Direct Nitro fetch skipped:", err.message);
-            }
-          }
-
-          // 2. Fallback: Build clean offline index.html directly from compiled CSS & JS bundles
-          function walkFiles(dir, base = dir, list = []) {
-            if (!fs.existsSync(dir)) return list;
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const full = path.join(dir, entry.name);
-              if (entry.isDirectory()) walkFiles(full, base, list);
-              else list.push("/" + path.relative(base, full).replace(/\\/g, "/"));
-            }
-            return list;
-          }
-
-          const allFiles = walkFiles(assetsDir);
-          const cssFiles = allFiles.filter((f) => f.endsWith(".css"));
-          const jsFiles = allFiles.filter((f) => f.endsWith(".js") && !f.includes("sw") && !f.includes("workbox"));
-
-          let entryScripts = [];
-          const manifestPaths = [
-            ".output/public/.vite/manifest.json",
-            "dist/.vite/manifest.json",
-            "dist/client/.vite/manifest.json"
-          ];
-          for (const mp of manifestPaths) {
-            if (fs.existsSync(mp)) {
-              try {
-                const manifest = JSON.parse(fs.readFileSync(mp, "utf8"));
-                for (const val of Object.values(manifest)) {
-                  if (val && val.isEntry && val.file) {
-                    entryScripts.push("/" + val.file.replace(/^\/+/, ""));
-                  }
-                }
-              } catch (_) {}
-            }
-          }
-
-          if (entryScripts.length === 0) {
-            const namedEntries = jsFiles.filter((f) => /\/(main|client|entry|index|app)-[^/]+\.js$/i.test(f));
-            entryScripts = namedEntries.length > 0 ? namedEntries : jsFiles;
-          }
-
-          if (entryScripts.length === 0) {
-            console.error("ERROR: No compiled JS bundles found in", assetsDir);
+          if (!fs.existsSync(nitroEntry)) {
+            console.error("ERROR: Neither static index.html nor .output/server/index.mjs was found!");
             process.exit(1);
           }
 
-          const cssTags = cssFiles.map((href) => `    <link rel="stylesheet" crossorigin href="${href}">`).join("\n");
-          const jsTags = entryScripts.map((src) => `    <script type="module" crossorigin src="${src}"></script>`).join("\n");
+          process.env.PORT = "0";
+          process.env.NITRO_PORT = "0";
+          process.env.HOST = "127.0.0.1";
+          process.env.NITRO_HOST = "127.0.0.1";
+          process.env.NODE_ENV = "production";
 
-          const fallbackHtml = `<!DOCTYPE html>
-          <html lang="en" class="dark">
-            <head>
-              <meta charset="UTF-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-              <meta name="theme-color" content="#09090B" />
-              <title>Dark Pomodoro</title>
-          ${cssTags}
-            </head>
-            <body style="margin:0;background:#09090B;color:#FAFAFA;">
-              <div id="root"></div>
-          ${jsTags}
-            </body>
-          </html>
-          `;
+          const mod = await import(pathToFileURL(nitroEntry).href);
+          console.log("Nitro module exports:", Object.keys(mod), "default type:", typeof mod.default);
 
-          fs.writeFileSync(indexOut, fallbackHtml, "utf8");
-          console.log("Generated offline index.html with entries:", entryScripts);
+          let html = "";
+          const fetchCandidates = [mod?.default?.fetch, mod?.fetch, mod?.handler?.fetch].filter(
+            (fn) => typeof fn === "function"
+          );
+
+          for (const fetchFn of fetchCandidates) {
+            try {
+              const res = await fetchFn(new Request("http://localhost/"));
+              const text = await res.text();
+              if (text && text.includes("<html")) {
+                html = text;
+                break;
+              }
+            } catch (e) {
+              console.log("Fetch candidate failed:", e.message);
+            }
+          }
+
+          if (!html) {
+            const fnCandidates = [mod?.default, mod?.handler].filter((fn) => typeof fn === "function");
+            for (const fn of fnCandidates) {
+              try {
+                const text = await renderViaNodeListener(fn);
+                if (text && text.includes("<html")) {
+                  html = text;
+                  break;
+                }
+              } catch (e) {
+                console.log("Node listener candidate failed:", e.message);
+              }
+            }
+          }
+
+          if (!html || !html.includes("<html")) {
+            console.error("ERROR: Failed to render valid HTML from Nitro server.");
+            process.exit(1);
+          }
+
+          fs.writeFileSync(indexOut, html, "utf8");
+          console.log("Successfully rendered index.html:", html.length, "bytes");
+          console.log("HTML preview:", html.slice(0, 300).replace(/\s+/g, " "));
+          process.exit(0);
           EOF
 
           node build-offline-assets.mjs
@@ -368,6 +359,7 @@ jobs:
 
           import android.app.Activity;
           import android.graphics.Color;
+          import android.net.Uri;
           import android.os.Bundle;
           import android.view.Window;
           import android.view.WindowManager;
@@ -408,8 +400,9 @@ jobs:
                   webView.setWebViewClient(new WebViewClient() {
                       @Override
                       public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                          if ("appassets.androidplatform.net".equals(request.getUrl().getHost())) {
-                              String path = request.getUrl().getPath();
+                          Uri url = request.getUrl();
+                          if ("appassets.androidplatform.net".equals(url.getHost())) {
+                              String path = url.getPath();
                               if (path == null || path.isEmpty() || path.equals("/") || !path.contains(".")) {
                                   try {
                                       return new WebResourceResponse(
@@ -420,11 +413,11 @@ jobs:
                                   } catch (Exception ignored) {}
                               }
                           }
-                          return assetLoader.shouldInterceptRequest(request.getUrl());
+                          return assetLoader.shouldInterceptRequest(url);
                       }
                   });
 
-                  webView.loadUrl("https://appassets.androidplatform.net/index.html");
+                  webView.loadUrl("https://appassets.androidplatform.net/");
               }
 
               @Override
