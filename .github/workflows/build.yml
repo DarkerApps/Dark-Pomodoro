@@ -19,11 +19,17 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept Android SDK Licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Setup Android SDK Directly
+        run: |
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          rm -f /tmp/cmdline-tools.zip
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;34.0.0" "platforms;android-34"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -54,7 +60,7 @@ jobs:
       - name: Update & Build Signed APK & Play Store AAB
         run: |
           bubblewrap update --skipVersionUpgrade
-          printf "android123\nandroid123\n" | bubblewrap build --skipPwaValidation
+          (sleep 2; echo "android123"; sleep 2; echo "android123") | bubblewrap build --skipPwaValidation
 
       - name: Generate assetlinks.json & Package Output Files
         run: |
@@ -62,7 +68,7 @@ jobs:
           cp app-release-signed.apk release-files/
           cp app-release-bundle.aab release-files/
           cp android.keystore release-files/
-          SHA256=$(keytool -list -v -keystore android.keystore -alias android -storepass android123 | grep "SHA256:" | sed 's/.*SHA256: //')
+          SHA256=$(keytool -list -v -keystore android.keystore -alias android -storepass android123 | grep "SHA256:" | head -n 1 | sed 's/.*SHA256: //' | tr -d ' \r\n')
           PKG_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('twa-manifest.json', 'utf8')).packageId)")
           printf '[{"relation":["delegate_permission/common.handle_all_urls"],"target":{"namespace":"android_app","package_name":"%s","sha256_cert_fingerprints":["%s"]}}]\n' "$PKG_ID" "$SHA256" > release-files/assetlinks.json
           cat release-files/assetlinks.json
