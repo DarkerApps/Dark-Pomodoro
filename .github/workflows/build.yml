@@ -49,7 +49,7 @@ jobs:
           cat << 'EOF' > build-offline-assets.mjs
           import fs from "fs";
           import path from "path";
-          import { spawn } from "child_process";
+          import { pathToFileURL } from "url";
 
           const workspace = process.env.GITHUB_WORKSPACE;
           const assetsDir = path.join(workspace, "offline-app/app/src/main/assets");
@@ -65,51 +65,95 @@ jobs:
 
           const indexOut = path.join(assetsDir, "index.html");
           if (fs.existsSync(indexOut) && fs.statSync(indexOut).size > 100) {
-            console.log("Found static index.html:", fs.statSync(indexOut).size, "bytes");
+            console.log("Found existing static index.html:", fs.statSync(indexOut).size, "bytes");
             process.exit(0);
           }
 
-          console.log("Pre-rendering index.html from built Nitro/Vite server...");
-          const hasNitroServer = fs.existsSync(".output/server/index.mjs");
-          const cmd = hasNitroServer ? "node" : "npx";
-          const args = hasNitroServer
-            ? [".output/server/index.mjs"]
-            : ["vite", "preview", "--port", "4173", "--host", "127.0.0.1"];
+          // 1. Try invoking Nitro's Web Fetch handler directly in memory (no TCP port needed)
+          const nitroEntry = path.resolve(".output/server/index.mjs");
+          if (fs.existsSync(nitroEntry)) {
+            try {
+              const mod = await import(pathToFileURL(nitroEntry).href);
+              const fetchFn = mod?.default?.fetch || mod?.fetch;
+              if (typeof fetchFn === "function") {
+                const res = await fetchFn(new Request("http://localhost/"));
+                const html = await res.text();
+                if (html && html.includes("<html")) {
+                  fs.writeFileSync(indexOut, html, "utf8");
+                  console.log("Rendered index.html via Nitro fetch handler:", html.length, "bytes");
+                  process.exit(0);
+                }
+              }
+            } catch (err) {
+              console.log("Direct Nitro fetch skipped:", err.message);
+            }
+          }
 
-          const server = spawn(cmd, args, {
-            env: {
-              ...process.env,
-              PORT: "4173",
-              NITRO_PORT: "4173",
-              HOST: "127.0.0.1",
-              NITRO_HOST: "127.0.0.1",
-              NODE_ENV: "production",
-            },
-            stdio: "inherit",
-          });
+          // 2. Fallback: Build clean offline index.html directly from compiled CSS & JS bundles
+          function walkFiles(dir, base = dir, list = []) {
+            if (!fs.existsSync(dir)) return list;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) walkFiles(full, base, list);
+              else list.push("/" + path.relative(base, full).replace(/\\/g, "/"));
+            }
+            return list;
+          }
 
-          async function waitAndCapture() {
-            for (let i = 0; i < 40; i++) {
-              await new Promise((r) => setTimeout(r, 500));
+          const allFiles = walkFiles(assetsDir);
+          const cssFiles = allFiles.filter((f) => f.endsWith(".css"));
+          const jsFiles = allFiles.filter((f) => f.endsWith(".js") && !f.includes("sw") && !f.includes("workbox"));
+
+          let entryScripts = [];
+          const manifestPaths = [
+            ".output/public/.vite/manifest.json",
+            "dist/.vite/manifest.json",
+            "dist/client/.vite/manifest.json"
+          ];
+          for (const mp of manifestPaths) {
+            if (fs.existsSync(mp)) {
               try {
-                const res = await fetch("http://127.0.0.1:4173/");
-                if (res.ok) {
-                  const html = await res.text();
-                  if (html && html.includes("<html")) {
-                    fs.writeFileSync(indexOut, html, "utf8");
-                    console.log("Successfully pre-rendered index.html:", html.length, "bytes");
-                    server.kill("SIGTERM");
-                    process.exit(0);
+                const manifest = JSON.parse(fs.readFileSync(mp, "utf8"));
+                for (const val of Object.values(manifest)) {
+                  if (val && val.isEntry && val.file) {
+                    entryScripts.push("/" + val.file.replace(/^\/+/, ""));
                   }
                 }
               } catch (_) {}
             }
-            console.error("ERROR: Timed out waiting for server to render index.html");
-            server.kill("SIGTERM");
+          }
+
+          if (entryScripts.length === 0) {
+            const namedEntries = jsFiles.filter((f) => /\/(main|client|entry|index|app)-[^/]+\.js$/i.test(f));
+            entryScripts = namedEntries.length > 0 ? namedEntries : jsFiles;
+          }
+
+          if (entryScripts.length === 0) {
+            console.error("ERROR: No compiled JS bundles found in", assetsDir);
             process.exit(1);
           }
 
-          waitAndCapture();
+          const cssTags = cssFiles.map((href) => `    <link rel="stylesheet" crossorigin href="${href}">`).join("\n");
+          const jsTags = entryScripts.map((src) => `    <script type="module" crossorigin src="${src}"></script>`).join("\n");
+
+          const fallbackHtml = `<!DOCTYPE html>
+          <html lang="en" class="dark">
+            <head>
+              <meta charset="UTF-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+              <meta name="theme-color" content="#09090B" />
+              <title>Dark Pomodoro</title>
+          ${cssTags}
+            </head>
+            <body style="margin:0;background:#09090B;color:#FAFAFA;">
+              <div id="root"></div>
+          ${jsTags}
+            </body>
+          </html>
+          `;
+
+          fs.writeFileSync(indexOut, fallbackHtml, "utf8");
+          console.log("Generated offline index.html with entries:", entryScripts);
           EOF
 
           node build-offline-assets.mjs
@@ -380,7 +424,7 @@ jobs:
                       }
                   });
 
-                  webView.loadUrl("https://appassets.androidplatform.net/");
+                  webView.loadUrl("https://appassets.androidplatform.net/index.html");
               }
 
               @Override
