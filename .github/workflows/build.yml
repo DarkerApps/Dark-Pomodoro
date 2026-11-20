@@ -10,6 +10,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Validate twa-manifest.json
+        run: node -e "JSON.parse(require('fs').readFileSync('twa-manifest.json', 'utf8')); console.log('twa-manifest.json is valid JSON');"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -21,8 +36,7 @@ jobs:
       - name: Configure Bubblewrap Paths Non-Interactively
         run: |
           mkdir -p ~/.bubblewrap
-          JDK_DIR="${JAVA_HOME_17_X64:-$JAVA_HOME}"
-          printf '{"jdkPath":"%s","androidSdkPath":"%s"}\n' "$JDK_DIR" "$ANDROID_HOME" > ~/.bubblewrap/config.json
+          printf '{"jdkPath":"%s","androidSdkPath":"%s"}\n' "$JAVA_HOME" "$ANDROID_HOME" > ~/.bubblewrap/config.json
           cat ~/.bubblewrap/config.json
 
       - name: Generate Private Signing Keystore
@@ -37,21 +51,21 @@ jobs:
             -keypass android123 \
             -dname "CN=Dark Pomodoro, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
 
-      - name: Build Signed APK & Play Store AAB
-        env:
-          BUBBLEWRAP_KEYSTORE_PASSWORD: android123
-          BUBBLEWRAP_KEY_PASSWORD: android123
+      - name: Update & Build Signed APK & Play Store AAB
         run: |
           bubblewrap update --skipVersionUpgrade
-          bubblewrap build --skipPwaValidation
+          printf "android123\nandroid123\n" | bubblewrap build --skipPwaValidation
 
-      - name: Package Output Files
+      - name: Generate assetlinks.json & Package Output Files
         run: |
           mkdir -p release-files
           cp app-release-signed.apk release-files/
           cp app-release-bundle.aab release-files/
           cp android.keystore release-files/
-          cp assetlinks.json release-files/ || true
+          SHA256=$(keytool -list -v -keystore android.keystore -alias android -storepass android123 | grep "SHA256:" | sed 's/.*SHA256: //')
+          PKG_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('twa-manifest.json', 'utf8')).packageId)")
+          printf '[{"relation":["delegate_permission/common.handle_all_urls"],"target":{"namespace":"android_app","package_name":"%s","sha256_cert_fingerprints":["%s"]}}]\n' "$PKG_ID" "$SHA256" > release-files/assetlinks.json
+          cat release-files/assetlinks.json
 
       - name: Upload Signed APK, AAB & Keystore
         uses: actions/upload-artifact@v4
