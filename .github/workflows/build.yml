@@ -1,4 +1,4 @@
-name: Build Signed PWA APK & AAB
+name: Build Offline Signed APK
 
 on:
   workflow_dispatch:
@@ -10,8 +10,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate twa-manifest.json
-        run: node -e "JSON.parse(require('fs').readFileSync('twa-manifest.json', 'utf8')); console.log('twa-manifest.json is valid JSON');"
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -19,34 +21,39 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Setup Android SDK Directly
+      - name: Accept Android SDK Licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Compile Lovable App into Offline Web Bundle
         run: |
-          export ANDROID_HOME="$HOME/android-sdk"
-          export ANDROID_SDK_ROOT="$HOME/android-sdk"
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
-          unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
-          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-          rm -f /tmp/cmdline-tools.zip
-          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses
-          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" "platform-tools" "build-tools;34.0.0" "platforms;android-34" "build-tools;35.0.0" "platforms;android-35"
-          ls -la "$ANDROID_HOME"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          mkdir -p web-src offline-app/app/src/main/assets
+          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            unzip -q "$ZIP_FILE" -d web-src
+          else
+            cp -r ./* web-src/ 2>/dev/null || true
+          fi
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+          PKG_PATH=$(find web-src -maxdepth 3 -name "package.json" | head -n 1)
+          if [ -z "$PKG_PATH" ]; then
+            echo "ERROR: package.json not found inside uploaded ZIP!"
+            exit 1
+          fi
 
-      - name: Install Google Bubblewrap CLI
-        run: npm install -g @bubblewrap/cli
+          APP_DIR=$(dirname "$PKG_PATH")
+          echo "Building app from: $APP_DIR"
+          cd "$APP_DIR"
+          npm install --legacy-peer-deps
+          npm run build
 
-      - name: Configure Bubblewrap Paths Non-Interactively
-        run: |
-          mkdir -p ~/.bubblewrap
-          printf '{"jdkPath":"%s","androidSdkPath":"%s"}\n' "$JAVA_HOME" "$ANDROID_HOME" > ~/.bubblewrap/config.json
-          cat ~/.bubblewrap/config.json
+          if [ -d "dist" ]; then
+            cp -r dist/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+          elif [ -d "build" ]; then
+            cp -r build/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+          else
+            echo "ERROR: Build output folder (dist/build) not found!"
+            exit 1
+          fi
 
       - name: Generate Private Signing Keystore
         run: |
@@ -60,24 +67,267 @@ jobs:
             -keypass android123 \
             -dname "CN=Dark Pomodoro, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
 
-      - name: Update & Build Signed APK & Play Store AAB
+      - name: Create Offline Android Project
         run: |
-          bubblewrap update --skipVersionUpgrade
-          (yes "android123" || true) | bubblewrap build --skipPwaValidation
+          mkdir -p offline-app/app/src/main/java/com/captanprice/midnightfocus
+          mkdir -p offline-app/app/src/main/res/values
+          mkdir -p offline-app/app/src/main/res/mipmap-xxxhdpi
 
-      - name: Generate assetlinks.json & Package Output Files
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const zlib = require("zlib");
+
+          const assetsDir = "offline-app/app/src/main/assets";
+          const outIcon = "offline-app/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png";
+          const candidates = ["icon-512.png", "icon-maskable-512.png", "icon-192.png", "icon-maskable-192.png", "apple-touch-icon.png"];
+
+          let copied = false;
+          for (const name of candidates) {
+            const p = path.join(assetsDir, name);
+            if (fs.existsSync(p)) {
+              const buf = fs.readFileSync(p);
+              if (buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+                fs.writeFileSync(outIcon, buf);
+                console.log("Using app icon:", name);
+                copied = true;
+                break;
+              }
+            }
+          }
+
+          if (!copied) {
+            const w = 512, h = 512, rowSize = 1 + w * 4;
+            const raw = Buffer.alloc(rowSize * h);
+            for (let y = 0; y < h; y++) {
+              raw[y * rowSize] = 0;
+              for (let x = 0; x < w; x++) {
+                const idx = y * rowSize + 1 + x * 4;
+                raw[idx] = 9; raw[idx + 1] = 9; raw[idx + 2] = 11; raw[idx + 3] = 255;
+              }
+            }
+            const compressed = zlib.deflateSync(raw);
+            function chunk(type, data) {
+              const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+              const t = Buffer.from(type);
+              const crcBuf = Buffer.concat([t, data]);
+              let c = 0xffffffff;
+              for (let i = 0; i < crcBuf.length; i++) {
+                c ^= crcBuf[i];
+                for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+              }
+              const crc = Buffer.alloc(4); crc.writeUInt32BE((c ^ 0xffffffff) >>> 0, 0);
+              return Buffer.concat([len, t, data, crc]);
+            }
+            const ihdr = Buffer.alloc(13);
+            ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+            ihdr[8] = 8; ihdr[9] = 6;
+            fs.writeFileSync(outIcon, Buffer.concat([
+              Buffer.from([137,80,78,71,13,10,26,10]),
+              chunk("IHDR", ihdr),
+              chunk("IDAT", compressed),
+              chunk("IEND", Buffer.alloc(0))
+            ]));
+          }
+          '
+
+          cat << 'EOF' > offline-app/settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "DarkPomodoroOffline"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > offline-app/build.gradle
+          plugins {
+              id 'com.android.application' version '8.6.0' apply false
+          }
+          EOF
+
+          cat << 'EOF' > offline-app/gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > offline-app/app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.captanprice.midnightfocus'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.captanprice.midnightfocus"
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0.0"
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file("../../android.keystore")
+                      storePassword "android123"
+                      keyAlias "android"
+                      keyPassword "android123"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.12.1'
+          }
+          EOF
+
+          cat << 'EOF' > offline-app/app/src/main/res/values/styles.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.DeviceDefault.NoActionBar">
+                  <item name="android:windowBackground">#09090B</item>
+                  <item name="android:statusBarColor">#09090B</item>
+                  <item name="android:navigationBarColor">#09090B</item>
+              </style>
+          </resources>
+          EOF
+
+          cat << 'EOF' > offline-app/app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Dark Pomodoro"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > offline-app/app/src/main/java/com/captanprice/midnightfocus/MainActivity.java
+          package com.captanprice.midnightfocus;
+
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import androidx.webkit.WebViewAssetLoader;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  webView = new WebView(this);
+                  webView.setBackgroundColor(Color.parseColor("#09090B"));
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setAllowFileAccess(false);
+                  settings.setAllowContentAccess(false);
+
+                  final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder()
+                          .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          WebResourceResponse response = assetLoader.shouldInterceptRequest(request.getUrl());
+                          if (response == null && request.getUrl().getHost() != null &&
+                              request.getUrl().getHost().equals("appassets.androidplatform.net")) {
+                              String path = request.getUrl().getPath();
+                              if (path == null || !path.contains(".")) {
+                                  try {
+                                      return new WebResourceResponse(
+                                          "text/html",
+                                          "UTF-8",
+                                          getAssets().open("index.html")
+                                      );
+                                  } catch (Exception ignored) {}
+                              }
+                          }
+                          return response;
+                      }
+                  });
+
+                  webView.loadUrl("https://appassets.androidplatform.net/");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Compile Signed Offline APK
+        run: |
+          cd offline-app
+          gradle assembleRelease --no-daemon
+
+      - name: Package Offline APK & Keystore
         run: |
           mkdir -p release-files
-          cp app-release-signed.apk release-files/
-          cp app-release-bundle.aab release-files/
+          cp offline-app/app/build/outputs/apk/release/app-release.apk release-files/Dark-Pomodoro-Offline.apk
           cp android.keystore release-files/
-          SHA256=$(keytool -list -v -keystore android.keystore -alias android -storepass android123 | grep "SHA256:" | head -n 1 | sed 's/.*SHA256: //' | tr -d ' \r\n')
-          PKG_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('twa-manifest.json', 'utf8')).packageId)")
-          printf '[{"relation":["delegate_permission/common.handle_all_urls"],"target":{"namespace":"android_app","package_name":"%s","sha256_cert_fingerprints":["%s"]}}]\n' "$PKG_ID" "$SHA256" > release-files/assetlinks.json
-          cat release-files/assetlinks.json
 
-      - name: Upload Signed APK, AAB & Keystore
+      - name: Upload Offline APK Package
         uses: actions/upload-artifact@v4
         with:
-          name: Dark-Pomodoro-Package
+          name: Dark-Pomodoro-Offline-APK
           path: release-files/
