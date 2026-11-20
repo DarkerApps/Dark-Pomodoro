@@ -46,20 +46,16 @@ jobs:
           npm install --legacy-peer-deps
           npm run build
 
-          if [ -d "dist" ]; then
-            cp -r dist/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
-          elif [ -d "build" ]; then
-            cp -r build/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
-          else
-            echo "ERROR: Build output folder (dist/build) not found!"
+          INDEX_FILE=$(find dist build -maxdepth 3 -name "index.html" 2>/dev/null | head -n 1)
+          if [ -z "$INDEX_FILE" ]; then
+            echo "ERROR: index.html not found in build output!"
             exit 1
           fi
 
+          OUT_DIR=$(dirname "$INDEX_FILE")
+          echo "Copying compiled frontend from: $OUT_DIR"
+          cp -r "$OUT_DIR"/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
           ls -la "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
-          if [ ! -f "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/index.html" ]; then
-            echo "ERROR: index.html missing from compiled assets!"
-            exit 1
-          fi
 
       - name: Generate Private Signing Keystore
         run: |
@@ -84,12 +80,12 @@ jobs:
           const path = require("path");
           const zlib = require("zlib");
 
-          const assetsDir = "offline-app/app/src/main/assets";
           const outIcon = "offline-app/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png";
 
           function findPngFiles(dir, list = []) {
             if (!fs.existsSync(dir)) return list;
             for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.name === "node_modules") continue;
               const full = path.join(dir, entry.name);
               if (entry.isDirectory()) findPngFiles(full, list);
               else if (entry.name.toLowerCase().endsWith(".png")) list.push(full);
@@ -97,7 +93,10 @@ jobs:
             return list;
           }
 
-          const allPngs = findPngFiles(assetsDir);
+          const allPngs = [
+            ...findPngFiles("offline-app/app/src/main/assets"),
+            ...findPngFiles("web-src")
+          ];
           const priority = ["512", "maskable", "192", "icon", "logo"];
           let chosen = null;
           for (const key of priority) {
@@ -307,9 +306,7 @@ jobs:
                   webView.setWebViewClient(new WebViewClient() {
                       @Override
                       public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                          WebResourceResponse response = assetLoader.shouldInterceptRequest(request.getUrl());
-                          if ((response == null || response.getData() == null) &&
-                              "appassets.androidplatform.net".equals(request.getUrl().getHost())) {
+                          if ("appassets.androidplatform.net".equals(request.getUrl().getHost())) {
                               String path = request.getUrl().getPath();
                               if (path == null || path.equals("/") || !path.contains(".")) {
                                   try {
@@ -321,11 +318,11 @@ jobs:
                                   } catch (Exception ignored) {}
                               }
                           }
-                          return response;
+                          return assetLoader.shouldInterceptRequest(request.getUrl());
                       }
                   });
 
-                  webView.loadUrl("https://appassets.androidplatform.net/index.html");
+                  webView.loadUrl("https://appassets.androidplatform.net/");
               }
 
               @Override
