@@ -49,7 +49,6 @@ jobs:
           cat << 'EOF' > build-offline-assets.mjs
           import fs from "fs";
           import path from "path";
-          import http from "http";
           import { pathToFileURL } from "url";
 
           const workspace = process.env.GITHUB_WORKSPACE;
@@ -70,79 +69,118 @@ jobs:
             process.exit(0);
           }
 
-          async function renderViaNodeListener(listener) {
-            return await new Promise((resolve, reject) => {
-              const server = http.createServer(listener);
-              server.listen(0, "127.0.0.1", async () => {
-                try {
-                  const addr = server.address();
-                  const res = await fetch(`http://127.0.0.1:${addr.port}/`);
-                  const text = await res.text();
-                  server.close();
-                  resolve(text);
-                } catch (err) {
-                  server.close();
-                  reject(err);
+          const mockEnv = {
+            ASSETS: {
+              fetch: async (reqOrUrl) => {
+                const rawUrl = typeof reqOrUrl === "string" ? reqOrUrl : reqOrUrl.url;
+                const u = new URL(rawUrl, "http://localhost/");
+                const rel = decodeURIComponent(u.pathname).replace(/^\/+/, "");
+                const candidate = path.join(assetsDir, rel);
+                if (rel && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                  return new Response(fs.readFileSync(candidate));
                 }
-              });
-            });
-          }
+                return new Response("Not Found", { status: 404 });
+              },
+            },
+          };
 
-          const nitroEntry = path.resolve(".output/server/index.mjs");
-          if (!fs.existsSync(nitroEntry)) {
-            console.error("ERROR: Neither static index.html nor .output/server/index.mjs was found!");
-            process.exit(1);
-          }
-
-          process.env.PORT = "0";
-          process.env.NITRO_PORT = "0";
-          process.env.HOST = "127.0.0.1";
-          process.env.NITRO_HOST = "127.0.0.1";
-          process.env.NODE_ENV = "production";
-
-          const mod = await import(pathToFileURL(nitroEntry).href);
-          console.log("Nitro module exports:", Object.keys(mod), "default type:", typeof mod.default);
+          const mockCtx = {
+            waitUntil: () => {},
+            passThroughOnException: () => {},
+          };
 
           let html = "";
-          const fetchCandidates = [mod?.default?.fetch, mod?.fetch, mod?.handler?.fetch].filter(
-            (fn) => typeof fn === "function"
-          );
-
-          for (const fetchFn of fetchCandidates) {
+          let usedFallback = false;
+          const nitroEntry = path.resolve(".output/server/index.mjs");
+          console.log("Nitro entry exists:", fs.existsSync(nitroEntry), nitroEntry);
+          if (fs.existsSync(nitroEntry)) {
             try {
-              const res = await fetchFn(new Request("http://localhost/"));
-              const text = await res.text();
-              if (text && text.includes("<html")) {
-                html = text;
-                break;
+              process.env.NODE_ENV = "production";
+              const mod = await import(pathToFileURL(nitroEntry).href);
+              console.log("Nitro module exports:", Object.keys(mod || {}));
+              const fetchFn = mod?.default?.fetch || mod?.fetch || mod?.handler?.fetch;
+              if (typeof fetchFn === "function") {
+                const res = await fetchFn(new Request("http://localhost/"), mockEnv, mockCtx);
+                const text = await res.text();
+                console.log("Nitro status:", res.status, "| contains <html:", text.includes("<html"), "| length:", text.length);
+                console.log("Nitro body preview:", text.slice(0, 200).replace(/\s+/g, " "));
+                if (text && text.includes("<html")) {
+                  html = text;
+                  console.log("Rendered index.html via Nitro Cloudflare handler:", html.length, "bytes");
+                }
+              } else {
+                console.log("Nitro handler FAILED: no fetch function found in module exports");
               }
-            } catch (e) {
-              console.log("Fetch candidate failed:", e.message);
+            } catch (err) {
+              console.log("Nitro handler FAILED:", err && err.stack ? err.stack : err);
             }
           }
 
           if (!html) {
-            const fnCandidates = [mod?.default, mod?.handler].filter((fn) => typeof fn === "function");
-            for (const fn of fnCandidates) {
-              try {
-                const text = await renderViaNodeListener(fn);
-                if (text && text.includes("<html")) {
-                  html = text;
-                  break;
-                }
-              } catch (e) {
-                console.log("Node listener candidate failed:", e.message);
+            usedFallback = true;
+            console.log("WARNING: Nitro render failed. Using fallback index.html (may show a BLACK SCREEN).");
+
+            function walkFiles(dir, base = dir, list = []) {
+              if (!fs.existsSync(dir)) return list;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walkFiles(full, base, list);
+                else list.push("/" + path.relative(base, full).replace(/\\/g, "/"));
+              }
+              return list;
+            }
+
+            const allFiles = walkFiles(assetsDir);
+            const cssFiles = allFiles.filter((f) => f.endsWith(".css"));
+            const jsFiles = allFiles.filter((f) => f.endsWith(".js") && !f.includes("sw") && !f.includes("workbox"));
+
+            let entryScripts = [];
+            for (const mp of [".output/public/.vite/manifest.json", "dist/.vite/manifest.json", "dist/client/.vite/manifest.json"]) {
+              if (fs.existsSync(mp)) {
+                try {
+                  const manifest = JSON.parse(fs.readFileSync(mp, "utf8"));
+                  for (const val of Object.values(manifest)) {
+                    if (val && val.isEntry && val.file) {
+                      entryScripts.push("/" + val.file.replace(/^\/+/, ""));
+                    }
+                  }
+                } catch (_) {}
               }
             }
-          }
 
-          if (!html || !html.includes("<html")) {
-            console.error("ERROR: Failed to render valid HTML from Nitro server.");
-            process.exit(1);
+            if (entryScripts.length === 0) {
+              const named = jsFiles.filter((f) => /\/(main|client|entry|index|app)-[^/]+\.js$/i.test(f));
+              entryScripts = named.length > 0 ? named : jsFiles;
+            }
+
+            if (entryScripts.length === 0) {
+              console.error("ERROR: No compiled JS bundles found!");
+              process.exit(1);
+            }
+
+            const cssTags = cssFiles.map((href) => `    <link rel="stylesheet" crossorigin href="${href}">`).join("\n");
+            const jsTags = entryScripts.map((src) => `    <script type="module" crossorigin src="${src}"></script>`).join("\n");
+
+            html = `<!DOCTYPE html>
+          <html lang="en" class="dark">
+            <head>
+              <meta charset="UTF-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+              <meta name="theme-color" content="#09090B" />
+              <title>Dark Pomodoro</title>
+          ${cssTags}
+            </head>
+            <body style="margin:0;background:#09090B;color:#FAFAFA;">
+              <div id="root"></div>
+          ${jsTags}
+            </body>
+          </html>
+          `;
+            console.log("Generated fallback index.html with entries:", entryScripts);
           }
 
           fs.writeFileSync(indexOut, html, "utf8");
-          console.log("Successfully rendered index.html:", html.length, "bytes");
+          console.log("RESULT:", usedFallback ? "FALLBACK index.html (likely black screen)" : "REAL rendered index.html");
           console.log("HTML preview:", html.slice(0, 300).replace(/\s+/g, " "));
           process.exit(0);
           EOF
