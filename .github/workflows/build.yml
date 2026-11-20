@@ -1,0 +1,56 @@
+name: Build Signed PWA APK & AAB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Google Bubblewrap CLI
+        run: npm install -g @bubblewrap/cli
+
+      - name: Configure Bubblewrap Paths
+        run: bubblewrap updateConfig --jdkPath="$JAVA_HOME" --androidSdkPath="$ANDROID_HOME"
+
+      - name: Generate Private Signing Keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore android.keystore \
+            -alias android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=Dark Pomodoro, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
+
+      - name: Build Signed APK & Play Store AAB
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: android123
+          BUBBLEWRAP_KEY_PASSWORD: android123
+        run: |
+          bubblewrap update --skipVersionUpgrade
+          bubblewrap build --skipPwaValidation
+
+      - name: Package Output Files
+        run: |
+          mkdir -p release-files
+          cp app-release-signed.apk release-files/
+          cp app-release-bundle.aab release-files/
+          cp android.keystore release-files/
+          cp assetlinks.json release-files/ || true
+
+      - name: Upload Signed APK, AAB & Keystore
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dark-Pomodoro-Package
+          path: release-files/
